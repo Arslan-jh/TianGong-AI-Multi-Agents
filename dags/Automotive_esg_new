@@ -1,0 +1,789 @@
+import json
+import os
+from datetime import timedelta
+from functools import partial
+import httpx
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator as DummyOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.sensors.time_delta import TimeDeltaSensor
+from httpx import RequestError
+from datetime import datetime
+
+BASE_URL = "http://host.docker.internal:7778"
+TOKEN = Variable.get("FAST_API_TOKEN")
+
+agent_url = "/openai_agent/invoke"
+openai_url = "/openai_chain/invoke"
+session_id = datetime.timestamp(datetime.now())
+
+def post_request(
+    post_url: str,
+    formatter: callable,
+    ti: any,
+    data_to_send: dict = None,
+):
+    if not data_to_send:
+        data_to_send = formatter(ti)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    with httpx.Client(base_url=BASE_URL, headers=headers, timeout=600) as client:
+        try:
+            response = client.post(post_url, json=data_to_send)
+            response.raise_for_status()
+            data = response.json()
+            return data
+        except RequestError as req_err:
+            print(f"An error occurred during the request: {req_err}")
+        except Exception as err:
+            print(f"An unexpected error occurred: {err}")
+
+def task_PyOpr(
+    task_id: str,
+    callable_func,
+    # retries: int = 3,
+    # retry_delay=timedelta(seconds=3),
+    execution_timeout=timedelta(minutes=10),
+    op_kwargs: dict = None,
+):
+    return PythonOperator(
+        task_id=task_id,
+        python_callable=callable_func,
+        # retries=retries,
+        # retry_delay=retry_delay,
+        execution_timeout=execution_timeout,
+        op_kwargs=op_kwargs,
+    )
+
+def agent_formatter(ti, prompt: str = "", task_ids: list = None, session_id: str = ""):
+    if task_ids:
+        results = []
+        for task_id in task_ids:
+            data = ti.xcom_pull(task_ids=task_id)
+            task_output = data["output"]["output"]  # Output from agent
+            task_output_with_id = (
+                f"{task_id}:\n {task_output}"  # Concatenate task ID with its output
+            )
+            results.append(task_output_with_id)
+        content = "\n\n".join(results)  # Join all task results into a single string
+        formatted_data = {
+            "input": {"input":prompt + "\n\n INPUT:" + content},
+            "config": {"configurable": {"session_id": session_id}},
+        }
+        return formatted_data
+    else:
+        pass
+
+def openai_formatter(ti, prompt: str = None, task_ids: list = None):
+    results = []
+    for task_id in task_ids:
+        data = ti.xcom_pull(task_ids=task_id)
+        task_output = data["output"]["output"]  # Output from agent
+        task_output_with_id = (
+            f"{task_id}:\n {task_output}"  # Concatenate task ID with its output
+        )
+        results.append(task_output_with_id)
+    content = "\n\n".join(results)  # Join all task results into a single string
+    if prompt:
+        content = "MUST NOT contains '#', '-', '*'." + prompt + "\n\n" + content
+    formatted_data = {"input": content}
+    return formatted_data
+
+def openai_translate_formatter(ti, task_ids:list = None):
+    results = []
+    for task_id in task_ids:
+        data = ti.xcom_pull(task_ids=task_id)
+        task_output = str(data)
+        results.append(task_output)
+    content = "\n\n".join(results)
+    prompt = "Translate English text related to corporate ESG reports into native Chinese:" + "\n\n" + content
+    formatted_data = {"input": prompt}
+    return formatted_data
+
+def Emissions_merge(ti):
+    result_0 = ti.xcom_pull(task_ids="Scope_emissions_data_summary")["output"]["output"]
+    result_1 = ti.xcom_pull(task_ids="Scope_emissions_breakdown_summary")["output"]["output"]
+    result_2 = ti.xcom_pull(task_ids="Scope_emissions_verification")["output"]["output"]
+    concatenated_result = (
+        "1 Emissions\n"
+        + "1.1 Scope emissions data\n"
+        + result_0
+        + "\n\n"
+        + "1.2 Scope emissions breakdown\n"
+        + result_1
+        + "\n\n"
+        + "1.3 Scope emissions verification\n"
+        + result_2
+        + "\n\n"
+    )
+    return concatenated_result
+
+def Target_merge(ti):
+    result_0 = ti.xcom_pull(task_ids="Automotive_sustainability_targets_summary")["output"]["output"]
+    result_1 = ti.xcom_pull(task_ids="Scope_emissions_reduction_targets_summary")["output"]["output"]
+    concatenated_result = (
+        "2 Target\n"
+        + "2.1 Automotive sustainability targets\n"
+        + result_0
+        + "\n\n"
+        + "2.2 Scope emissions reduction targets\n"
+        + result_1
+        + "\n\n"
+    )
+    return concatenated_result
+
+def Initiatives_merge(ti):
+    result_0 = ti.xcom_pull(task_ids="Emissions_reduction_instructions_overview")["output"]["output"]
+    concatenated_result = (
+        "3 Initiatives\n"
+        + "3.1 Reduction instructions\n"
+        + result_0
+        + "\n\n"
+    )
+    return concatenated_result
+
+def merge_EN(ti):
+    result_0 = ti.xcom_pull(task_ids="Emissions_output_merge")
+    result_1 = ti.xcom_pull(task_ids="Target_output_merge")
+    result_2 = ti.xcom_pull(task_ids="Initiatives_output_merge")
+    concatenated_result = (
+        str(result_0)
+        + "\n\n"
+        + str(result_1)
+        + "\n\n"
+        + str(result_2)
+        + "\n\n"
+    )
+
+    markdown_file_name = "Automobile_esg_compliance_report_EN.md"
+
+    # Save the model's response to a Markdown file
+    with open(markdown_file_name, "w") as markdown_file:
+        markdown_file.write(concatenated_result)
+    return concatenated_result
+
+def merge_CN(ti):
+    result_0 = ti.xcom_pull(task_ids="Emissions_translate")["output"]["content"]
+    result_1 = ti.xcom_pull(task_ids="Target_translate")["output"]["content"]
+    result_2 = ti.xcom_pull(task_ids="Initiatives_translate")["output"]["content"]
+    concatenated_result = (result_0 + "\n\n" + result_1 + "\n\n" + result_2 + "\n\n")
+    markdown_file_name = "Automotive_esg_compliance_report_CN.md"
+
+    # Save the model's response to a Markdown file
+    with open(markdown_file_name, "w") as markdown_file:
+        markdown_file.write(concatenated_result)
+    return concatenated_result
+
+def save_file(ti, file_name: str = "Automotive_esg_compliance_report_CN.md"):
+    data = ti.xcom_pull(task_ids="Translate")["output"]["content"]
+    with open(file_name, "w") as markdown_file:
+        markdown_file.write(data)
+    return data
+
+Rules_prompt = """Must strictly abide by the following 4 rules prompt guidelines.
+1. Summarize [Specific company name]'s data across various categories for [specific year], output must AVOIDE extraneous details to ensure conciseness and a professional tone.
+2. If the data is not disclosed or no relevant data is found, simply output: [Specific Task ID] data for [Specific Company Name] was not disclosed in [Specific Year].
+3. The output result MUST NOT contains "#", "-", "*".
+4. Further details should be directed to an "Additional Information" section. The focus should be on relaying integral but previously unmentioned aspects of the report, ensuring a comprehensive overview is provided.\n"""
+
+# Summary formatters
+Scope_emissions_data_summary_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+1.1.1 Total emissions data (Both the title and the preceding serial number need to be retained)\n
+Example: "[Specific company name]'s Total greenhouse gas emissions in [specific year] are [X metric tons CO2e]".\n
+
+1.1.2 Scope 1 emissions data (Both the title and the preceding serial number need to be retained)\n
+Objective: Extract and summarize the global gross Scope 1 emissions and detail these emissions by type of greenhouse gas, including CO2, CH4, N2O, HFCs, PFCs, SF6, NF3, and others. Only export disclosed gas data!\n
+Example: "
+[Specific company name]'s Total Scope 1 greenhouse gas emissions in [specific year] are [X metric tons CO2e].
+CO2: [Value in metric tons CO2e]
+CH4: [Value in metric tons CO2e]
+N2O: [Value in metric tons CO2e]
+HFCs: [Value in metric tons CO2e]
+PFCs: [Value in metric tons CO2e]
+SF6: [Value in metric tons CO2e]
+NF3: [Value in metric tons CO2e]
+Other GHGs: [Value in metric tons CO2e], includes any additional greenhouse gases not categorized above."\n
+
+1.1.3 Scope 2 emissions data (Both the title and the preceding serial number need to be retained)\n
+Objective: Provide the total gross Scope 2 emissions and describe the approach to reporting Scope 2 emissions(location-based or market-based approach).\n
+Example: "
+Data: [Specific company name]'s Total Scope 2 greenhouse gas emissions in [specific year] are [X metric tons CO2e]
+Approach: Detailed description". \n
+
+1.1.4 Scope 3 emissions data (Both the title and the preceding serial number need to be retained)\n
+Objective: Report the total gross global Scope 3 emissions categorize and detail these emissions into upstream and downstream activities, and describe the methods used to calculate Scope 3 emissions.
+Example: "
+Data: [Specific company name]'s Total Scope 3 greenhouse gas emissions in [specific year] are [X metric tons CO2e]
+Methods used to calculate Scope 3 emissions: Detailed description.
+Categories: Category 1: Purchased goods and services, [Value in metric tons CO2e].
+Category 2: Capital goods, [Value in metric tons CO2e].
+Category 3: Fuel and energy-related activities not included in Scope 1 or Scope 2, [Value in metric tons CO2e].
+Category 4: Upstream transportation and distribution, [Value in metric tons CO2e].
+Category 5: Waste generated in operations, [Value in metric tons CO2e].
+Category 6: Business travel, [Value in metric tons CO2e].
+Category 7: Employee commuting, [Value in metric tons CO2e].
+Category 8: Upstream leased assets, [Value in metric tons CO2e].
+Category 9: Downstream transportation and distribution, [Value in metric tons CO2e].
+Category 10: Processing of sold products, [Value in metric tons CO2e].
+Category 11: Use of sold products, [Value in metric tons CO2e].
+Category 12: End-of-life treatment of sold products, [Value in metric tons CO2e].
+Category 13: Downstream leased assets, [Value in metric tons CO2e].
+Category 14: Franchises, [Value in metric tons CO2e].
+Category 15: Investments, [Value in metric tons CO2e]."\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n""",
+    task_ids=[
+        "Total_emissions_data",
+        "Scope_1_emissions_data",
+        "Scope_2_emissions_data",
+        "Scope_3_emissions_data",
+    ],
+    session_id=session_id,
+)
+
+Scope_emissions_breakdown_summary_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+1.2.1 Subsidiary emissions data (Both the title and the preceding serial number need to be retained)\n
+Objective: Disclose scope 1 and 2 emissions data of subsidiaries. 
+Example:"
+(1) Apple, Inc. (Parent Company), Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+(1.1)SolarCity Corporation (Subsidiary), Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+(1.2)Gigafactory 1 (Operational Entity), Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e]."\n
+
+1.2.2 Scope emissions by Region (Both the title and the preceding serial number need to be retained)\n
+Objective: Break down the total gross global Scope 1 and Scope 2 emissions by country/area/region.
+Example: "
+United States: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+China: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+Germany: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e]."\n
+Other Countries/Areas/Regions: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e]."\n
+
+1.2.3 Scope emissions by Business (Both the title and the preceding serial number need to be retained)\n
+Objective: Break down the total gross global Scope 1 and Scope 2 emissions by business division, facility, or activity.
+Example: "
+Automobile Division: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+Battery Division: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e].
+Solar Division: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e]."\n
+Other Business Divisions/Facilities/Activities: Scope 1 Emissions: [Value in metric tons CO2e], Scope 2 Emissions: [Value in metric tons CO2e]."\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n""",
+    task_ids=[
+        "Subsidiary_emissions_data",
+        "Scope_emissions_by_Region",
+        "Scope_emissions_by_Business",
+    ],
+    session_id=session_id,
+)
+
+Scope_emissions_verification_summary_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+1.3.1 Emissions performance (Both the title and the preceding serial number need to be retained)\n
+Objective: Verify if the report includes third-party verification or certification for its Scope 1, Scope 2, and Scope 3 emissions. Must contain "Verification Body", "Certification Standards", "Verification Statement", and "Cross-verification and Stakeholder Feedback".\n
+Example: "Apple, Inc.
+(1)Verification boundary: Apple's Scope 1, Scope 2, and Scope 3 emissions  were verified.
+(2)Verification Body: The third-party verification for Apple's Scope 1 emissions in 2022 was conducted by GreenVerify Inc., a globally recognized environmental consulting firm with expertise in GHG emissions verification.
+(3)Certification Standards: The verification process adhered to the ISO 14064-3 standard, which provides guidance for the verification and validation of greenhouse gas assertions. GreenVerify Inc. also utilized The Greenhouse Gas Protocol's Corporate Accounting and Reporting Standard to ensure a comprehensive evaluation.
+(4)Verification Statement: GreenVerify Inc. has issued a statement confirming that Apple's reported Scope 1 emissions for 2022 are accurate, complete, and conform to the specified standards. The verification process involved a thorough review of Apple's emission calculation methodologies, data collection processes, and emission factor sourcing.
+(5)Cross-verification and Stakeholder Feedback: In addition to third-party verification, Apple engages in cross-verification practices by comparing reported emissions against internal records and past reports for consistency. We also welcome and incorporate feedback from stakeholders, including environmental groups, investors, and regulatory bodies, to continually enhance the accuracy and reliability of our environmental reporting."\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n""",
+    task_ids=[
+        "Scope_emissions_verification",
+    ],
+    session_id=session_id,
+)
+
+Automotive_sustainability_targets_summary_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+2.1.1 Climate Pledge(Both the title and the preceding serial number need to be retained)\n
+Objective: Make it clear which year the company sets to achieve carbon neutrality, it must be a precise time point.\n
+Example:"The target year set for [Specific Company Name] to achieve carbon neutrality is specified as [Specific year]."\n
+
+2.1.2 Emission reduction per vehicle(Both the title and the preceding serial number need to be retained)\n
+Objective: Based on the information provided, output from the following 2 aspects.
+(1)Current Emissions: Describe the current emissions per car in the report, including "use phase" and "production phase" emissions.
+(2)Emissions Reduction Target: Describe the target of reduction of the CO2 emissions per car, and clarify the timepoint.\n
+
+2.1.3 New energy vehicle production target(Both the title and the preceding serial number need to be retained)\n
+Objective: Based on the information provided, output from the following 2 aspects.
+(1)Current Proportions: Describe the EV and PHEV proportions in the [Specific Company Name] vehicle production.
+(2)Commitment to EV/PHEV Production: Describe the [Specific Company Name] commitment to increasing the share of EVs and PHEVs in the vehicle production, and specify the timeline.\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n""",
+    task_ids=[
+        "Climate_Pledge",
+        "Emission_reduction_per_car",
+        "New_energy_vehicle_production_target",
+    ],
+    session_id=session_id,
+)
+
+Scope_emissions_reduction_targets_summary_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+2.2.1 Scope emissions reduction targets(Both the title and the preceding serial number need to be retained)\n
+Objective: Based on the information provided, output from the following 3 aspects. Describe the emissions reduction target, clarify the scope of the target, and verify if it is recognized as a science-based target by the Science Based Targets initiative (SBTi).\n
+(1)Reduction Target: Describe the emissions reduction target in the report(including total, Scope 1, Scope 2, and Scope 3),  quantified in metric tons of CO2 equivalent (CO2e), and specify the timeline.
+(2)Scope of Reduction: Describe the scope, include entire company, specific business division, certain business activity, single site or facility, specified country/area/region, product-specific.
+(3)Recognition by SBTi: Comfirm if the target is approved as a science-based target by the Science Based Targets initiative (SBTi).\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n
+""",
+    task_ids=[
+        "Scope_emissions_reduction_targets",
+    ],
+    session_id=session_id,
+)
+
+Emissions_reduction_instructions_overview_formatter = partial(
+    agent_formatter,
+    prompt= Rules_prompt +"""
+3.1.1 Emissions_reduction_instructions (Both the title and the preceding serial number need to be retained)\n
+Objective: Detail the steps being taken to reduce emissions, including actions during the planning and execution phases, and the expected carbon reductions. Must Need very detailed explanation.\n
+Example: "Apple, Inc.
+(1)Planning Phase:
+(1.1)In-Depth Carbon Footprint Assessment: Apple undertook an exhaustive analysis of its carbon footprint, pinpointing primary sources of emissions across vehicle production, facility operations, and the broader supply chain. This rigorous assessment served as the foundation for our tailored emissions reduction strategy.
+(1.2)Engagement with Stakeholders: Apple's strategy has been enriched by active dialogue with a diverse group of stakeholders, including consumers, shareholders, and environmental advocates. Their insights have been instrumental in refining our emissions reduction roadmap.
+(2)Execution Phase:
+(2.1)Apple Solar Initiative: Apple has significantly invested in renewable energy, including the installation of over 1 million solar panels across our facilities worldwide and entering into power purchase agreements for wind energy that exceed 500 MW. Impact: These initiatives have led to a quantifiable reduction of over 2 million metric tons of CO2e annually.
+(2.2)Facility Energy Optimization:Apple has implemented energy-saving measures across all facilities, including LED lighting upgrades, HVAC system optimizations, and the introduction of energy-efficient manufacturing processes. Impact: These improvements have resulted in estimated emissions savings of 300,000 metric tons of CO2e annually.
+(2.3)Fleet Electrification: : Apple has fully electrified its service and delivery fleet, replacing over 5,000 conventional vehicles with electric models. Impact: This transition has contributed to a reduction of approximately 50,000 metric tons of CO2e emissions annually.
+(2.4)Sustainable Supply Chain Initiatives:Apple has worked with suppliers to adopt sustainable sourcing criteria and improve logistics efficiency, reducing overall supply chain emissions. Impact: These strategies have led to an estimated reduction of 400,000 metric tons of CO2e annually."\n
+
+Additional information (Both the title and the preceding serial number need to be retained)\n""",
+    task_ids=[
+        "Emissions_reduction_instructions",
+    ],
+    session_id="",
+)
+
+Emissions_translate_formatter = partial(
+    openai_translate_formatter,
+    task_ids=["Emissions_output_merge"],
+)
+
+Target_translate_formatter = partial(
+    openai_translate_formatter,
+    task_ids=["Target_output_merge"],
+)
+
+Initiatives_translate_formatter = partial(
+    openai_translate_formatter,
+    task_ids=["Initiatives_output_merge"],
+)
+
+# write agent for each task
+agent = partial(post_request, post_url=agent_url, formatter=agent_formatter)
+# openai = partial(post_request, post_url=openai_url, formatter=openai_formatter)
+Scope_emissions_data_summary_agent = partial(
+    post_request, post_url=agent_url, formatter=Scope_emissions_data_summary_formatter
+)
+Scope_emissions_breakdown_summary_agent = partial(
+    post_request, post_url=agent_url, formatter=Scope_emissions_breakdown_summary_formatter
+)
+Scope_emissions_verification_agent = partial(
+    post_request, post_url=agent_url, formatter=Scope_emissions_verification_summary_formatter
+)
+Automotive_sustainability_targets_summary_agent = partial(
+    post_request, post_url=agent_url, formatter=Automotive_sustainability_targets_summary_formatter
+)
+Scope_emissions_reduction_targets_summary_agent = partial(
+    post_request, post_url=agent_url, formatter=Scope_emissions_reduction_targets_summary_formatter
+)
+Emissions_reduction_instructions_overview_agent = partial(
+    post_request, post_url=agent_url, formatter=Emissions_reduction_instructions_overview_formatter
+)
+Emissions_translate_agent = partial(
+    post_request, post_url=openai_url, formatter=Emissions_translate_formatter
+)
+Target_translate_agent = partial(
+    post_request, post_url=openai_url, formatter=Target_translate_formatter
+)
+Initiatives_translate_agent = partial(
+    post_request, post_url=openai_url, formatter=Initiatives_translate_formatter
+)
+
+default_args = {
+    "owner": "airflow",
+}
+
+with DAG(
+    dag_id="Automotive_esg_1",
+    default_args=default_args,
+    description="Automotive esg agent dag",
+    schedule_interval=None,
+    concurrency=2,
+    tags=["Automotive_ESG_agent"],
+    catchup=False,
+) as dag:
+    # wait_for_10_seconds = TimeDeltaSensor(
+    # task_id='wait_for_10_seconds',
+    # delta=timedelta(seconds=10),
+
+
+# Total emissions data task
+    Total_emissions_data = task_PyOpr(
+        task_id="Total_emissions_data",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Extract the 'total global GHG gross emissions' for the specified year, measured in metric tons of CO2 equivalent (CO2e). The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope 1 emissions data task
+    Scope_1_emissions_data = task_PyOpr(
+        task_id="Scope_1_emissions_data",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Extract the 'absolute global gross Scope 1/Direct emissions' for the specified year, measured in metric tons of CO2 equivalent (CO2e). 2. Detail these emissions by type of greenhouse gas, including CO2, CH4, N2O, HFCs, PFCs, SF6, NF3, and others. 3. Specify the metric tons of CO2e for each gas and identify the source of the global warming potential (GWP) values used in the calculations. The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope 2 emissions data task
+    Scope_2_emissions_data = task_PyOpr(
+        task_id="Scope_2_emissions_data",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Retrieve the 'total gross Scope 2/Indirect emissions' for the specified year,  measured in metric tons of CO2 equivalent (CO2e). 2. Describe the approach to reporting Scope 2 emissions, clarifying whether a location-based or market-based approach is used. The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope 3 emissions data task
+    Scope_3_emissions_data = task_PyOpr(
+        task_id="Scope_3_emissions_data",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Extract the 'total gross global Scope 3 emissions' for the specified year, measured in metric tons of CO2 equivalent (CO2e). 2. Detail these emissions by categorizing them into purchased goods and services, capital goods, fuel- and energy-related activities not included in Scope 1 or Scope 2, upstream transportation and distribution, waste generated in operations, business travel, employee commuting, upstream leased assets, downstream transportation and distribution, processing of sold products, use of sold products, end-of-life treatment of sold products, downstream leased assets, franchises, and investments. Provide specific figures for each category in metric tons of CO2 equivalent (CO2e). 3. Additionally, describe the methods used to calculate Scope 3 emissions. Ensure the data corresponds precisely to the requested year, even if the report spans multiple years."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Emissions summary task
+    Scope_emissions_data_summary = task_PyOpr(
+        task_id="Scope_emissions_data_summary",
+        callable_func=Scope_emissions_data_summary_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Subsidiary task
+    Subsidiary_emissions_data = task_PyOpr(
+        task_id="Subsidiary_emissions_data",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Extract and summarize disaggregated emission data for each subsidiary for the specified year, specifying Scope 1 and Scope 2 emissions separately. Use the following unique identifiers for each entity as applicable: ISIN code for bonds, ISIN code for equities, CUSIP number, Ticker symbol, SEDOL code, LEI number, or any other unique identifier provided. Detail the emissions data explicitly for each identifier associated with the subsidiaries mentioned in the report. The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope emissions by Region task
+    Scope_emissions_by_Region = task_PyOpr(
+        task_id="Scope_emissions_by_Region",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Break down the total gross global Scope 1 and Scope 2 emissions by country/area/region, measured in metric tons of CO2 equivalent (CO2e). The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope emissions by Business task
+    Scope_emissions_by_Business = task_PyOpr(
+        task_id="Scope_emissions_by_Business",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Break down the total gross global Scope 1 and Scope 2 emissions by business division, facility, or activity, measured in metric tons of CO2 equivalent (CO2e). The data may span multiple years, confirm and retrieve only the emissions data that precisely matches the requested year."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope emissions breakdown summary task
+    Scope_emissions_breakdown_summary = task_PyOpr(
+        task_id="Scope_emissions_breakdown_summary",
+        callable_func=Scope_emissions_breakdown_summary_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Scope emissions verification task
+    Scope_emissions_verification = task_PyOpr(
+        task_id="Scope_emissions_verification",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Verify if the report includes third-party verification or certification for its Scope 1, Scope 2, and Scope 3 emissions.  Must contain 'Verification Body', 'Certification Standards', 'Verification Statement', and 'Cross-verification and Stakeholder Feedback'."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope emissions verification summary task
+    Scope_emissions_verification_summary = task_PyOpr(
+        task_id="Scope_emissions_verification_summary",
+        callable_func=Scope_emissions_verification_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Climate Pledge
+    Climate_Pledge = task_PyOpr(
+        task_id="Climate_Pledge",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "Specify the section or timepoint in the report where the commitment to achieve carbon neutrality or greenhouse gas emission neutrality is detailed."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Emission reduction per vehicle
+    Emission_reduction_per_car = task_PyOpr(
+        task_id="Emission_reduction_per_car",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Provide a detailed description of the current CO2 emissions per car in the specified year. 2. Detail the target for reducing CO2 emissions per car, include the specific timepoint by which this target is to be achieved."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# New energy vehicle production target
+    New_energy_vehicle_production_target = task_PyOpr(
+        task_id="New_energy_vehicle_production_target",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Provide a detailed description of the current proportion of plug-in hybrid vehicles (PHEVs) and pure electric vehicles (EVs) for the specified year.2. Specify the extent of the company's commitment to increasing the share of PHEVs and EVs, and indicate the timeline by which these targets are expected to be realized."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Automotive sustainability targets summary task
+    Automotive_sustainability_targets_summary = task_PyOpr(
+        task_id="Automotive_sustainability_targets_summary",
+        callable_func=Automotive_sustainability_targets_summary_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Scope emissions reduction targets
+    Scope_emissions_reduction_targets = task_PyOpr(
+        task_id="Scope_emissions_reduction_targets",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Extract the total, Scope 1, Scope 2, and Scope 3 emissions reduction objectives from the report, each quantified in metric tons of CO2 equivalent (CO2e). For the Scope 3 reduction targets, ensure they encompass all 15 categories. 2. Identify the specific scope of these reduction targets, which may include: the entire company, a particular business division, a certain business activity, a single site or facility, a specified country/area/region, product-specific goals, or any other defined category—please provide details. 3. Determine if these emissions reduction targets are recognized as science-based targets by the Science Based Targets initiative (SBTi). Confirm and retrieve only the data for the requested year, ensuring it matches precisely, even if the report includes multiple years."
+                },
+                "config": {"configurable": {"session_id": session_id}},
+            }
+        },
+    )
+
+# Scope emissions reduction targets summary task
+    Scope_emissions_reduction_targets_summary = task_PyOpr(
+        task_id="Scope_emissions_reduction_targets_summary",
+        callable_func=Scope_emissions_reduction_targets_summary_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Emissions reduction instructions task
+    Emissions_reduction_instructions = task_PyOpr(
+        task_id="Emissions_reduction_instructions",
+        callable_func=agent,
+        op_kwargs={
+            "data_to_send": {
+                "input": {
+                    "input": "1. Assess if the report indicates any ongoing efforts to reduce emissions, including activities such as recycling and reuse, battery optimization, life cycle assessment (LCA), carbon footprint management, environmentally friendly warehousing, green packaging, green logistics, energy-saving and emission-reduced production, use of renewable energy, and sustainable procurement. 2. Describe these emission reduction actions in detail, covering both the planning and execution phases. 3. Provide an estimation of the anticipated CO2 equivalent (CO2e) emission reductions resulting from these actions, measured in metric tons of CO2e."
+                },
+                "config": {"configurable": {"session_id": ""}},
+            }
+        },
+    )
+
+# Emissions reduction instructions overview task
+    Emissions_reduction_instructions_overview = task_PyOpr(
+        task_id="Emissions_reduction_instructions_overview",
+        callable_func=Emissions_reduction_instructions_overview_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Emissions output merge task
+    Emissions_output_merge = PythonOperator(
+        task_id="Emissions_output_merge",
+        python_callable=Emissions_merge,
+    )
+
+# Emissions translate task
+    Emissions_translate = task_PyOpr(
+        task_id="Emissions_translate",
+        callable_func=Emissions_translate_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Target output merge task
+    Target_output_merge = PythonOperator(
+        task_id="Target_output_merge",
+        python_callable=Target_merge,
+    )
+
+#  Target translate task
+    Target_translate = task_PyOpr(
+        task_id="Target_translate",
+        callable_func=Target_translate_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+# Initiatives output merge task
+    Initiatives_output_merge = PythonOperator(
+        task_id="Initiatives_output_merge",
+        python_callable=Initiatives_merge,
+    )
+
+# Initiatives translate task
+    Initiatives_translate = task_PyOpr(
+        task_id="Initiatives_translate",
+        callable_func=Initiatives_translate_agent,
+        execution_timeout=timedelta(minutes=30),
+    )
+
+    Merge_EN = task_PyOpr(
+        task_id="Merge_EN",
+        callable_func=merge_EN,
+    )
+
+    Merge_CN = task_PyOpr(
+        task_id="Merge_CN",
+        callable_func=merge_CN,
+    )
+
+    (
+        [
+            Total_emissions_data,
+            Scope_1_emissions_data,
+            Scope_2_emissions_data,
+            Scope_3_emissions_data,
+        ] 
+            >> Scope_emissions_data_summary
+    )
+
+    (
+        [
+            Subsidiary_emissions_data,
+            Scope_emissions_by_Region,
+            Scope_emissions_by_Business,
+        ] 
+            >> Scope_emissions_breakdown_summary
+    )
+
+    (
+        [
+            Scope_emissions_verification,
+        ] 
+            >> Scope_emissions_verification_summary
+    )
+
+    (
+        [
+            Scope_emissions_data_summary,
+            Scope_emissions_breakdown_summary,
+            Scope_emissions_verification_summary,
+        ]
+            >> Emissions_output_merge
+            >> Emissions_translate
+    )
+
+    (
+        [
+            Climate_Pledge,
+            Emission_reduction_per_car,
+            New_energy_vehicle_production_target,
+        ]
+            >> Automotive_sustainability_targets_summary
+    )
+
+    (
+        [
+            Scope_emissions_reduction_targets,
+        ]
+            >> Scope_emissions_reduction_targets_summary
+    )
+
+    (
+        [
+            Automotive_sustainability_targets_summary,
+            Scope_emissions_reduction_targets_summary,
+        ]
+            >> Target_output_merge
+            >> Target_translate
+    )
+
+    (
+        [
+            Emissions_reduction_instructions,
+        ] 
+            >> Emissions_reduction_instructions_overview
+    )
+
+    (
+        [
+            Emissions_reduction_instructions_overview,
+        ] 
+            >> Initiatives_output_merge
+            >> Initiatives_translate
+    )
+
+
+    [
+        Emissions_output_merge,
+        Target_output_merge,
+        Initiatives_output_merge,
+    ] >> Merge_EN
+
+    [
+        Emissions_translate,
+        Target_translate,
+        Initiatives_translate,
+    ] >> Merge_CN
